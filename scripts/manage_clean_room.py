@@ -3,6 +3,18 @@
 Create or update a BigQuery Analytics Hub data clean room, add a
 privacy-safe (threshold-enforced) view, and grant publisher/subscriber
 access — all via the official Google Cloud SDK, no Terraform involved.
+
+Usage:
+  python manage_clean_room.py \
+      --clean-room-name patient_data \
+      --project-id project-33186132-7866-4181-982 \
+      --location asia-southeast1 \
+      --dataset-id my_patient_dataset \
+      --source-table patien_table \
+      --privacy-unit-col patient_id \
+      --threshold 50 \
+      --publishers user:sayedbasha996@gmail.com \
+      --subscribers user:nehasayed122004@gmail.com
 """
 
 import argparse
@@ -25,12 +37,16 @@ def create_or_get_exchange(client, project_id, location, exchange_id, display_na
             ),
         )
         result = client.create_data_exchange(
-            parent=parent, data_exchange_id=exchange_id, data_exchange=exchange
+            request={
+                "parent": parent,
+                "data_exchange_id": exchange_id,
+                "data_exchange": exchange,
+            }
         )
         print(f"  Created exchange: {result.name}")
         return result
     except AlreadyExists:
-        result = client.get_data_exchange(name=name)
+        result = client.get_data_exchange(request={"name": name})
         print(f"  Exchange already exists: {result.name}")
         return result
 
@@ -49,7 +65,7 @@ def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
         AS SELECT * FROM {source_ref}
     """
     job = bq_client.query(query)
-    job.result()
+    job.result()  # wait for completion, raises on error
     print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name}")
 
 
@@ -73,15 +89,21 @@ def create_or_update_listing(client, project_id, location, exchange_id,
     )
     try:
         result = client.create_listing(
-            parent=parent, listing_id=listing_id, listing=listing
+            request={
+                "parent": parent,
+                "listing_id": listing_id,
+                "listing": listing,
+            }
         )
         print(f"  Created listing: {result.name}")
         return result
     except AlreadyExists:
         listing.name = name
         result = client.update_listing(
-            listing=listing,
-            update_mask={"paths": ["bigquery_dataset", "restricted_export_config"]},
+            request={
+                "listing": listing,
+                "update_mask": {"paths": ["bigquery_dataset", "restricted_export_config"]},
+            }
         )
         print(f"  Updated listing: {result.name}")
         return result
