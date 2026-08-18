@@ -23,6 +23,7 @@ import sys
 from google.api_core.exceptions import AlreadyExists, NotFound
 from google.cloud import bigquery
 from google.cloud import bigquery_analyticshub_v1 as analyticshub
+from google.iam.v1 import policy_pb2
 
 
 def create_or_get_exchange(client, project_id, location, exchange_id, display_name):
@@ -128,7 +129,9 @@ def grant_iam(client, resource_name, role, members, get_policy_fn, set_policy_fn
             found = True
             break
     if not found:
-        policy.bindings.append({"role": role, "members": list(new_members)})
+        policy.bindings.append(
+            policy_pb2.Binding(role=role, members=list(new_members))
+        )
 
     set_policy_fn(request={"resource": resource_name, "policy": policy})
     print(f"  {role}: granted to {new_members}")
