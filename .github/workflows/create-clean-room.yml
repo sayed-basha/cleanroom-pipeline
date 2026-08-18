@@ -1,0 +1,77 @@
+name: create-clean-room
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_room_name:
+        description: 'Unique name for this clean room (letters/numbers/underscores only)'
+        required: true
+        type: string
+      project_id:
+        description: 'GCP project this clean room lives in (leave blank to use default)'
+        required: false
+        default: ""
+        type: string
+      dataset_id:
+        description: 'BigQuery dataset to share'
+        required: true
+        type: string
+      source_table:
+        description: 'Table within that dataset to share'
+        required: true
+        type: string
+      privacy_unit_col:
+        description: 'Column identifying one entity, e.g. patient_id'
+        required: true
+        type: string
+      aggregation_threshold:
+        description: 'Minimum distinct entity count required to release a result row'
+        required: true
+        default: "50"
+        type: string
+      publisher_principal:
+        description: 'e.g. user:alice@company.com or group:data-eng@company.com'
+        required: false
+        default: ""
+        type: string
+      subscriber_principal:
+        description: 'e.g. user:bob@partner.com or group:partner-analysts@partner.com'
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  create-clean-room:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Create or update clean room
+        run: |
+          python scripts/manage_clean_room.py \
+            --clean-room-name "${{ github.event.inputs.clean_room_name }}" \
+            --project-id "${{ github.event.inputs.project_id || vars.GCP_PROJECT_ID }}" \
+            --location "${{ vars.DEFAULT_LOCATION }}" \
+            --dataset-id "${{ github.event.inputs.dataset_id }}" \
+            --source-table "${{ github.event.inputs.source_table }}" \
+            --privacy-unit-col "${{ github.event.inputs.privacy_unit_col }}" \
+            --threshold "${{ github.event.inputs.aggregation_threshold }}" \
+            --publishers "${{ github.event.inputs.publisher_principal }}" \
+            --subscribers "${{ github.event.inputs.subscriber_principal }}"
