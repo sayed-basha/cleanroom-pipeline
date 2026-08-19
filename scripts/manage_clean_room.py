@@ -85,13 +85,13 @@ def create_or_update_listing(client, project_id, location, exchange_id,
                 )
             ],
         ),
-        restricted_export_config=analyticshub.Listing.RestrictedExportConfig(
-            enabled=True,  # must stay True for any data clean room — not optional
-            restrict_query_result=restrict_query_result,
-            # restrict_direct_table_access is OUTPUT-ONLY per Google's API docs —
-            # it's auto-computed from `enabled`, not independently settable.
-        ),
+        restricted_export_config={
+            "enabled": True,  # must stay True for any data clean room — not optional
+            "restrict_query_result": restrict_query_result,
+        },
     )
+    print(f"  DEBUG: restrict_query_result being sent = {restrict_query_result}")
+    print(f"  DEBUG: listing.restricted_export_config = {listing.restricted_export_config}")
     try:
         result = client.create_listing(
             request={
@@ -101,6 +101,7 @@ def create_or_update_listing(client, project_id, location, exchange_id,
             }
         )
         print(f"  Created listing: {result.name}")
+        print(f"  VERIFY: stored restricted_export_config = {result.restricted_export_config}")
         return result
     except AlreadyExists:
         listing.name = name
@@ -111,6 +112,7 @@ def create_or_update_listing(client, project_id, location, exchange_id,
             }
         )
         print(f"  Updated listing: {result.name}")
+        print(f"  VERIFY: stored restricted_export_config = {result.restricted_export_config}")
         return result
 
 
