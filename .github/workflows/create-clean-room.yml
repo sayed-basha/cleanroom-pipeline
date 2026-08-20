@@ -35,12 +35,12 @@ on:
         type: boolean
         default: false
       publisher_principal:
-        description: 'e.g. user:alice@company.com or group:data-eng@company.com'
+        description: 'Email address (e.g. alice@company.com) — or group:name@company.com / serviceAccount:name@project.iam.gserviceaccount.com if needed'
         required: false
         default: ""
         type: string
       subscriber_principal:
-        description: 'e.g. user:bob@partner.com or group:partner-analysts@partner.com'
+        description: 'Email address (e.g. bob@partner.com) — or group:name@partner.com if needed'
         required: false
         default: ""
         type: string
