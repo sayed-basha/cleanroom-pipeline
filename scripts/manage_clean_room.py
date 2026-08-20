@@ -7,14 +7,14 @@ access — all via the official Google Cloud SDK, no Terraform involved.
 Usage:
   python manage_clean_room.py \
       --clean-room-name patient_data \
-      --project-id project-33186132-7866-4181-982 \
+      --project-id project-123456789 \
       --location asia-southeast1 \
       --dataset-id my_patient_dataset \
       --source-table patien_table \
       --privacy-unit-col patient_id \
       --threshold 50 \
-      --publishers user:sayedbasha996@gmail.com \
-      --subscribers user:nehasayed122004@gmail.com
+      --publishers user:alice@gmail.com \
+      --subscribers user:bob@gmail.com
 """
 
 import argparse
