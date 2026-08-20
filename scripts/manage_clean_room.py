@@ -71,8 +71,7 @@ def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
 
 
 def create_or_update_listing(client, project_id, location, exchange_id,
-                              listing_id, dataset_id, view_name, display_name,
-                              restrict_query_result=True):
+                              listing_id, dataset_id, view_name, display_name):
     parent = f"projects/{project_id}/locations/{location}/dataExchanges/{exchange_id}"
     name = f"{parent}/listings/{listing_id}"
     listing = analyticshub.Listing(
@@ -85,13 +84,10 @@ def create_or_update_listing(client, project_id, location, exchange_id,
                 )
             ],
         ),
-        restricted_export_config={
-            "enabled": True,  # must stay True for any data clean room — not optional
-            "restrict_query_result": restrict_query_result,
-        },
+        restricted_export_config=analyticshub.Listing.RestrictedExportConfig(
+            enabled=True, restrict_query_result=True
+        ),
     )
-    print(f"  DEBUG: restrict_query_result being sent = {restrict_query_result}")
-    print(f"  DEBUG: listing.restricted_export_config = {listing.restricted_export_config}")
     try:
         result = client.create_listing(
             request={
@@ -101,7 +97,6 @@ def create_or_update_listing(client, project_id, location, exchange_id,
             }
         )
         print(f"  Created listing: {result.name}")
-        print(f"  VERIFY: stored restricted_export_config = {result.restricted_export_config}")
         return result
     except AlreadyExists:
         listing.name = name
@@ -112,7 +107,6 @@ def create_or_update_listing(client, project_id, location, exchange_id,
             }
         )
         print(f"  Updated listing: {result.name}")
-        print(f"  VERIFY: stored restricted_export_config = {result.restricted_export_config}")
         return result
 
 
@@ -154,11 +148,6 @@ def main():
     p.add_argument("--threshold", type=int, required=True)
     p.add_argument("--publishers", nargs="*", default=[])
     p.add_argument("--subscribers", nargs="*", default=[])
-    p.add_argument(
-        "--allow-query-result-export",
-        action="store_true",
-        help="If set, subscribers CAN save/export query results. Default: disabled (safer).",
-    )
     args = p.parse_args()
 
     exchange_id = f"cleanroom_{args.clean_room_name}"
@@ -188,7 +177,6 @@ def main():
     create_or_update_listing(
         ah_client, args.project_id, args.location, exchange_id, listing_id,
         args.dataset_id, view_name, f"Shared Data - {args.clean_room_name}",
-        restrict_query_result=not args.allow_query_result_export,
     )
     listing_name = f"{exchange_name}/listings/{listing_id}"
 
