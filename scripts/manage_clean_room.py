@@ -84,9 +84,15 @@ def create_or_update_listing(client, project_id, location, exchange_id,
                 )
             ],
         ),
-        restricted_export_config=analyticshub.Listing.RestrictedExportConfig(
-            enabled=True, restrict_query_result=True
-        ),
+        # IMPORTANT: this must be a plain dict, not
+        # analyticshub.Listing.RestrictedExportConfig(...). Constructing it via
+        # the class constructor silently drops restrict_query_result when the
+        # request is sent — confirmed via debug logging against the live API.
+        # The dict form is the reliable way to set this nested message.
+        restricted_export_config={
+            "enabled": True,
+            "restrict_query_result": True,
+        },
     )
     try:
         result = client.create_listing(
