@@ -71,7 +71,8 @@ def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
 
 
 def create_or_update_listing(client, project_id, location, exchange_id,
-                              listing_id, dataset_id, view_name, display_name):
+                              listing_id, dataset_id, view_name, display_name,
+                              restrict_query_result=True):
     parent = f"projects/{project_id}/locations/{location}/dataExchanges/{exchange_id}"
     name = f"{parent}/listings/{listing_id}"
     listing = analyticshub.Listing(
@@ -84,9 +85,15 @@ def create_or_update_listing(client, project_id, location, exchange_id,
                 )
             ],
         ),
-        restricted_export_config=analyticshub.Listing.RestrictedExportConfig(
-            enabled=True, restrict_query_result=True
-        ),
+        # IMPORTANT: this must be a plain dict, not
+        # analyticshub.Listing.RestrictedExportConfig(...). Constructing it via
+        # the class constructor silently drops restrict_query_result when the
+        # request is sent — confirmed via debug logging against the live API.
+        # The dict form is the reliable way to set this nested message.
+        restricted_export_config={
+            "enabled": True,
+            "restrict_query_result": restrict_query_result,
+        },
     )
     try:
         result = client.create_listing(
@@ -148,6 +155,11 @@ def main():
     p.add_argument("--threshold", type=int, required=True)
     p.add_argument("--publishers", nargs="*", default=[])
     p.add_argument("--subscribers", nargs="*", default=[])
+    p.add_argument(
+        "--allow-query-result-export",
+        action="store_true",
+        help="If set, subscribers CAN save/export query results. Default: disabled (safer).",
+    )
     args = p.parse_args()
 
     exchange_id = f"cleanroom_{args.clean_room_name}"
@@ -177,6 +189,7 @@ def main():
     create_or_update_listing(
         ah_client, args.project_id, args.location, exchange_id, listing_id,
         args.dataset_id, view_name, f"Shared Data - {args.clean_room_name}",
+        restrict_query_result=not args.allow_query_result_export,
     )
     listing_name = f"{exchange_name}/listings/{listing_id}"
 

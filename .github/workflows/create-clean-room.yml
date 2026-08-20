@@ -29,6 +29,11 @@ on:
         required: true
         default: "50"
         type: string
+      allow_query_result_export:
+        description: 'Let subscribers save/export their query results? (unchecked = safer, results stay view-only)'
+        required: false
+        type: boolean
+        default: false
       publisher_principal:
         description: 'e.g. user:alice@company.com or group:data-eng@company.com'
         required: false
@@ -74,4 +79,5 @@ jobs:
             --privacy-unit-col "${{ github.event.inputs.privacy_unit_col }}" \
             --threshold "${{ github.event.inputs.aggregation_threshold }}" \
             --publishers "${{ github.event.inputs.publisher_principal }}" \
-            --subscribers "${{ github.event.inputs.subscriber_principal }}"
+            --subscribers "${{ github.event.inputs.subscriber_principal }}" \
+            ${{ github.event.inputs.allow_query_result_export == 'true' && '--allow-query-result-export' || '' }}
