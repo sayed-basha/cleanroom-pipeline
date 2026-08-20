@@ -26,6 +26,20 @@ from google.cloud import bigquery_analyticshub_v1 as analyticshub
 from google.iam.v1 import policy_pb2
 
 
+def normalize_principal(value):
+    """Accepts a plain email ('alice@company.com') and returns it prefixed as
+    'user:alice@company.com'. If the value already has a recognized prefix
+    (user:, group:, serviceAccount:, domain:), it's left untouched — this lets
+    people just type their email like they're used to, while still allowing
+    an explicit group:/serviceAccount: when that's actually needed."""
+    if not value:
+        return value
+    known_prefixes = ("user:", "group:", "serviceAccount:", "domain:")
+    if value.startswith(known_prefixes):
+        return value
+    return f"user:{value}"
+
+
 def create_or_get_exchange(client, project_id, location, exchange_id, display_name):
     parent = f"projects/{project_id}/locations/{location}"
     name = f"{parent}/dataExchanges/{exchange_id}"
@@ -161,6 +175,12 @@ def main():
         help="If set, subscribers CAN save/export query results. Default: disabled (safer).",
     )
     args = p.parse_args()
+
+    # Auto-prefix plain emails with "user:" — lets people type just their
+    # email address instead of needing to remember the user:/group: syntax.
+    # Also drops any blank entries (e.g. when the field was left empty).
+    args.publishers = [normalize_principal(m) for m in args.publishers if m]
+    args.subscribers = [normalize_principal(m) for m in args.subscribers if m]
 
     exchange_id = f"cleanroom_{args.clean_room_name}"
     listing_id = f"listing_{args.clean_room_name}"
