@@ -13,6 +13,7 @@ Usage:
       --source-table patien_table \
       --privacy-unit-col patient_id \
       --threshold 50 \
+      --columns "age,zip_code,diagnosis" \
       --publishers user:alice@gmail.com \
       --subscribers user:bob@gmail.com
 """
@@ -67,21 +68,43 @@ def create_or_get_exchange(client, project_id, location, exchange_id, display_na
 
 
 def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
-                            source_table, privacy_unit_col, threshold):
+                            source_table, privacy_unit_col, threshold,
+                            columns=None):
+    """Creates (or replaces) the privacy-safe view.
+
+    If `columns` is falsy/empty -> "Use all columns" (SELECT *).
+    If `columns` is a non-empty list -> "Custom select columns to publish".
+    The privacy_unit_col is always force-included in the custom list since
+    the aggregation threshold policy needs it present in the view, even if
+    the caller forgot to list it explicitly.
+    """
     view_ref = f"`{project_id}.{dataset_id}.{view_name}`"
     source_ref = f"`{project_id}.{dataset_id}.{source_table}`"
     privacy_policy_json = (
         '{"aggregation_threshold_policy": '
         f'{{"threshold": {threshold}, "privacy_unit_column": "{privacy_unit_col}"}}}}'
     )
+
+    if columns:
+        # Custom select columns to publish.
+        select_cols = list(dict.fromkeys(columns))  # de-dupe, keep order
+        if privacy_unit_col not in select_cols:
+            select_cols.append(privacy_unit_col)
+        select_clause = ", ".join(f"`{c}`" for c in select_cols)
+        mode_desc = f"custom columns ({select_clause})"
+    else:
+        # Use all columns.
+        select_clause = "*"
+        mode_desc = "all columns"
+
     query = f"""
         CREATE OR REPLACE VIEW {view_ref}
         OPTIONS (privacy_policy = '''{privacy_policy_json}''')
-        AS SELECT * FROM {source_ref}
+        AS SELECT {select_clause} FROM {source_ref}
     """
     job = bq_client.query(query)
     job.result()  # wait for completion, raises on error
-    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name}")
+    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name} [{mode_desc}]")
 
 
 def create_or_update_listing(client, project_id, location, exchange_id,
@@ -167,6 +190,14 @@ def main():
     p.add_argument("--source-table", required=True)
     p.add_argument("--privacy-unit-col", required=True)
     p.add_argument("--threshold", type=int, required=True)
+    p.add_argument(
+        "--columns",
+        default="",
+        help=(
+            "Comma or space separated list of columns to publish "
+            "(e.g. 'age,zip_code,diagnosis'). Leave blank to use all columns."
+        ),
+    )
     p.add_argument("--publishers", nargs="*", default=[])
     p.add_argument("--subscribers", nargs="*", default=[])
     p.add_argument(
@@ -181,6 +212,9 @@ def main():
     # Also drops any blank entries (e.g. when the field was left empty).
     args.publishers = [normalize_principal(m) for m in args.publishers if m]
     args.subscribers = [normalize_principal(m) for m in args.subscribers if m]
+
+    # Accept comma-separated or space-separated column lists.
+    columns = [c.strip() for c in args.columns.replace(",", " ").split() if c.strip()]
 
     exchange_id = f"cleanroom_{args.clean_room_name}"
     listing_id = f"listing_{args.clean_room_name}"
@@ -203,6 +237,7 @@ def main():
     create_or_replace_view(
         bq_client, args.project_id, args.dataset_id, view_name,
         args.source_table, args.privacy_unit_col, args.threshold,
+        columns=columns,
     )
 
     print(f"[3/4] Listing: {listing_id}")

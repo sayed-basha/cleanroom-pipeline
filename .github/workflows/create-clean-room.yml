@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: false
+      columns:
+        description: 'Comma-separated list of columns to publish (leave blank = use all columns)'
+        required: false
+        default: ""
+        type: string
       publisher_principal:
         description: 'Email address (e.g. alice@company.com) — or group:name@company.com / serviceAccount:name@project.iam.gserviceaccount.com if needed'
         required: false
@@ -78,6 +83,7 @@ jobs:
             --source-table "${{ github.event.inputs.source_table }}" \
             --privacy-unit-col "${{ github.event.inputs.privacy_unit_col }}" \
             --threshold "${{ github.event.inputs.aggregation_threshold }}" \
+            --columns "${{ github.event.inputs.columns }}" \
             --publishers "${{ github.event.inputs.publisher_principal }}" \
             --subscribers "${{ github.event.inputs.subscriber_principal }}" \
             ${{ github.event.inputs.allow_query_result_export == 'true' && '--allow-query-result-export' || '' }}
