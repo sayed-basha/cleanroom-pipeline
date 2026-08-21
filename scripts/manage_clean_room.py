@@ -41,6 +41,54 @@ def normalize_principal(value):
     return f"user:{value}"
 
 
+def get_table_schema(bq_client, project_id, dataset_id, source_table):
+    """Returns the set of top-level column names actually present on the
+    source table, straight from BigQuery's own metadata. Raises a clear
+    error immediately if the table doesn't exist, instead of letting that
+    surface later as a confusing failure from CREATE VIEW."""
+    table_ref = f"{project_id}.{dataset_id}.{source_table}"
+    try:
+        table = bq_client.get_table(table_ref)
+    except NotFound:
+        raise ValueError(
+            f"Source table not found: {table_ref}. "
+            f"Check --project-id, --dataset-id, and --source-table."
+        )
+    return {field.name for field in table.schema}
+
+
+def validate_columns(existing_columns, privacy_unit_col, requested_columns,
+                      source_table):
+    """Checks --privacy-unit-col and every entry in --columns against the
+    real schema. Fails fast with a specific list of what's wrong, rather
+    than letting an invalid CREATE VIEW statement hit the BigQuery API.
+
+    Note: this only validates top-level field names. Nested/repeated
+    (STRUCT/ARRAY) fields addressed with dotted paths, e.g. 'address.zip',
+    are not checked here and will pass through to BigQuery as-is.
+    """
+    missing = []
+
+    if privacy_unit_col not in existing_columns:
+        missing.append(privacy_unit_col)
+
+    for col in requested_columns:
+        # Skip dotted/nested paths — top-level schema listing can't validate
+        # these, so let BigQuery be the source of truth for those.
+        if "." in col:
+            continue
+        if col not in existing_columns:
+            missing.append(col)
+
+    if missing:
+        available = ", ".join(sorted(existing_columns))
+        bad = ", ".join(sorted(set(missing)))
+        raise ValueError(
+            f"Column(s) not found on table '{source_table}': {bad}.\n"
+            f"Available columns: {available}"
+        )
+
+
 def create_or_get_exchange(client, project_id, location, exchange_id, display_name):
     parent = f"projects/{project_id}/locations/{location}"
     name = f"{parent}/dataExchanges/{exchange_id}"
@@ -77,6 +125,9 @@ def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
     The privacy_unit_col is always force-included in the custom list since
     the aggregation threshold policy needs it present in the view, even if
     the caller forgot to list it explicitly.
+
+    Assumes columns/privacy_unit_col have already been validated against
+    the real table schema via validate_columns().
     """
     view_ref = f"`{project_id}.{dataset_id}.{view_name}`"
     source_ref = f"`{project_id}.{dataset_id}.{source_table}`"
@@ -223,7 +274,14 @@ def main():
     ah_client = analyticshub.AnalyticsHubServiceClient()
     bq_client = bigquery.Client(project=args.project_id)
 
-    print(f"[1/4] Clean room exchange: {exchange_id}")
+    print(f"[1/5] Validating schema against source table: {args.source_table}")
+    existing_columns = get_table_schema(
+        bq_client, args.project_id, args.dataset_id, args.source_table
+    )
+    validate_columns(existing_columns, args.privacy_unit_col, columns, args.source_table)
+    print(f"  OK — {len(existing_columns)} column(s) found, all requested columns exist")
+
+    print(f"[2/5] Clean room exchange: {exchange_id}")
     create_or_get_exchange(
         ah_client, args.project_id, args.location, exchange_id,
         f"Clean Room - {args.clean_room_name}",
@@ -233,14 +291,14 @@ def main():
         f"/dataExchanges/{exchange_id}"
     )
 
-    print(f"[2/4] Privacy-safe view: {view_name}")
+    print(f"[3/5] Privacy-safe view: {view_name}")
     create_or_replace_view(
         bq_client, args.project_id, args.dataset_id, view_name,
         args.source_table, args.privacy_unit_col, args.threshold,
         columns=columns,
     )
 
-    print(f"[3/4] Listing: {listing_id}")
+    print(f"[4/5] Listing: {listing_id}")
     create_or_update_listing(
         ah_client, args.project_id, args.location, exchange_id, listing_id,
         args.dataset_id, view_name, f"Shared Data - {args.clean_room_name}",
@@ -248,7 +306,7 @@ def main():
     )
     listing_name = f"{exchange_name}/listings/{listing_id}"
 
-    print("[4/4] IAM grants")
+    print("[5/5] IAM grants")
     if args.publishers:
         grant_iam(
             ah_client, exchange_name, "roles/analyticshub.publisher",
