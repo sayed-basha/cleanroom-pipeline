@@ -50,6 +50,16 @@ on:
         default: ""
         type: string
 
+# Serialize runs that target the same clean room, so two people triggering
+# this workflow around the same time for the same clean_room_name don't race
+# on the IAM policy read-modify-write in grant_iam().
+# Different clean_room_name values still run fully in parallel.
+# cancel-in-progress: false means the second run WAITS its turn instead of
+# killing the first one mid-grant.
+concurrency:
+  group: clean-room-${{ github.event.inputs.clean_room_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
