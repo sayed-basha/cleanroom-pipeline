@@ -1,5 +1,4 @@
 name: create-clean-room
-
 on:
   workflow_dispatch:
     inputs:
@@ -24,21 +23,54 @@ on:
         description: 'Column identifying one entity, e.g. patient_id'
         required: true
         type: string
-      aggregation_threshold:
-        description: 'Minimum distinct entity count required to release a result row'
+      rule_type:
+        description: 'Analysis rule to apply. If "differential_privacy", fill in the epsilon/delta fields below instead of the threshold field.'
         required: true
+        type: choice
+        options:
+          - aggregation
+          - differential_privacy
+        default: aggregation
+      aggregation_threshold:
+        description: '[Only used if rule_type=aggregation] Minimum distinct entity count required to release a result row'
+        required: false
         default: "50"
+        type: string
+      epsilon_budget:
+        description: '[Only used if rule_type=differential_privacy] Total epsilon budget for all queries against the view'
+        required: false
+        default: ""
+        type: string
+      max_epsilon_per_query:
+        description: '[Only used if rule_type=differential_privacy] Max epsilon a single query can consume'
+        required: false
+        default: ""
+        type: string
+      delta_budget:
+        description: '[Only used if rule_type=differential_privacy] Total delta budget for all queries against the view'
+        required: false
+        default: ""
+        type: string
+      delta_per_query:
+        description: '[Only used if rule_type=differential_privacy] Max delta a single query can consume'
+        required: false
+        default: ""
+        type: string
+      max_groups_contributed:
+        description: '[Optional, only used if rule_type=differential_privacy] Limits how many distinct groups one privacy unit can appear across'
+        required: false
+        default: ""
+        type: string
+      columns:
+        description: 'Comma-separated list of columns to publish (leave blank = use all columns)'
+        required: false
+        default: ""
         type: string
       allow_query_result_export:
         description: 'Let subscribers save/export their query results? (unchecked = safer, results stay view-only)'
         required: false
         type: boolean
         default: false
-      columns:
-        description: 'Comma-separated list of columns to publish (leave blank = use all columns)'
-        required: false
-        default: ""
-        type: string
       publisher_principal:
         description: 'Email address (e.g. alice@company.com) — or group:name@company.com / serviceAccount:name@project.iam.gserviceaccount.com if needed'
         required: false
@@ -52,10 +84,10 @@ on:
 
 # Serialize runs that target the same clean room, so two people triggering
 # this workflow around the same time for the same clean_room_name don't race
-# on the IAM policy read-modify-write in grant_iam().
-# Different clean_room_name values still run fully in parallel.
-# cancel-in-progress: false means the second run WAITS its turn instead of
-# killing the first one mid-grant.
+# on the IAM policy read-modify-write in grant_iam(). Different
+# clean_room_name values still run fully in parallel. cancel-in-progress:
+# false means the second run WAITS its turn instead of killing the first
+# one mid-grant.
 concurrency:
   group: clean-room-${{ github.event.inputs.clean_room_name }}
   cancel-in-progress: false
@@ -63,26 +95,21 @@ concurrency:
 permissions:
   contents: read
   id-token: write
-
 jobs:
   create-clean-room:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - id: auth
         uses: google-github-actions/auth@v3
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
-
       - name: Create or update clean room
         run: |
           python scripts/manage_clean_room.py \
@@ -92,7 +119,13 @@ jobs:
             --dataset-id "${{ github.event.inputs.dataset_id }}" \
             --source-table "${{ github.event.inputs.source_table }}" \
             --privacy-unit-col "${{ github.event.inputs.privacy_unit_col }}" \
-            --threshold "${{ github.event.inputs.aggregation_threshold }}" \
+            --rule-type "${{ github.event.inputs.rule_type }}" \
+            ${{ github.event.inputs.aggregation_threshold != '' && format('--threshold "{0}"', github.event.inputs.aggregation_threshold) || '' }} \
+            ${{ github.event.inputs.epsilon_budget != '' && format('--epsilon-budget "{0}"', github.event.inputs.epsilon_budget) || '' }} \
+            ${{ github.event.inputs.max_epsilon_per_query != '' && format('--max-epsilon-per-query "{0}"', github.event.inputs.max_epsilon_per_query) || '' }} \
+            ${{ github.event.inputs.delta_budget != '' && format('--delta-budget "{0}"', github.event.inputs.delta_budget) || '' }} \
+            ${{ github.event.inputs.delta_per_query != '' && format('--delta-per-query "{0}"', github.event.inputs.delta_per_query) || '' }} \
+            ${{ github.event.inputs.max_groups_contributed != '' && format('--max-groups-contributed "{0}"', github.event.inputs.max_groups_contributed) || '' }} \
             --columns "${{ github.event.inputs.columns }}" \
             --publishers "${{ github.event.inputs.publisher_principal }}" \
             --subscribers "${{ github.event.inputs.subscriber_principal }}" \

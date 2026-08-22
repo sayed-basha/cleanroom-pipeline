@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Create or update a BigQuery Analytics Hub data clean room, add a
-privacy-safe (threshold-enforced) view, and grant publisher/subscriber
-access — all via the official Google Cloud SDK, no Terraform involved.
+privacy-safe view (aggregation threshold OR differential privacy), and
+grant publisher/subscriber access — all via the official Google Cloud SDK,
+no Terraform involved.
 
-Usage:
+Usage (aggregation threshold — the default):
   python manage_clean_room.py \
       --clean-room-name patient_data \
       --project-id project-123456789 \
@@ -12,7 +13,26 @@ Usage:
       --dataset-id my_patient_dataset \
       --source-table patien_table \
       --privacy-unit-col patient_id \
+      --rule-type aggregation \
       --threshold 50 \
+      --columns "age,zip_code,diagnosis" \
+      --publishers user:alice@gmail.com \
+      --subscribers user:bob@gmail.com
+
+Usage (differential privacy):
+  python manage_clean_room.py \
+      --clean-room-name patient_data \
+      --project-id project-123456789 \
+      --location asia-southeast1 \
+      --dataset-id my_patient_dataset \
+      --source-table patien_table \
+      --privacy-unit-col patient_id \
+      --rule-type differential_privacy \
+      --epsilon-budget 10 \
+      --max-epsilon-per-query 1 \
+      --delta-budget 1e-5 \
+      --delta-per-query 1e-7 \
+      --max-groups-contributed 1 \
       --columns "age,zip_code,diagnosis" \
       --publishers user:alice@gmail.com \
       --subscribers user:bob@gmail.com
@@ -89,6 +109,54 @@ def validate_columns(existing_columns, privacy_unit_col, requested_columns,
         )
 
 
+def validate_rule_type_args(args):
+    """Cross-checks which fields were actually supplied against which rule
+    type was chosen. GitHub Actions can't hide irrelevant form fields, so
+    this is the real gate: it errors out clearly if the required fields for
+    the chosen rule type are missing, and warns (without failing) if fields
+    belonging to the *other* rule type were filled in by mistake."""
+    if args.rule_type == "aggregation":
+        if args.threshold is None:
+            raise ValueError(
+                "--threshold is required when --rule-type is 'aggregation'."
+            )
+        supplied_dp_fields = [
+            name for name, val in [
+                ("--epsilon-budget", args.epsilon_budget),
+                ("--max-epsilon-per-query", args.max_epsilon_per_query),
+                ("--delta-budget", args.delta_budget),
+                ("--delta-per-query", args.delta_per_query),
+                ("--max-groups-contributed", args.max_groups_contributed),
+            ] if val is not None
+        ]
+        if supplied_dp_fields:
+            print(
+                f"  NOTE: rule-type is 'aggregation' — ignoring differential "
+                f"privacy field(s) that were filled in: {', '.join(supplied_dp_fields)}"
+            )
+
+    elif args.rule_type == "differential_privacy":
+        missing = []
+        if args.epsilon_budget is None:
+            missing.append("--epsilon-budget")
+        if args.max_epsilon_per_query is None:
+            missing.append("--max-epsilon-per-query")
+        if args.delta_budget is None:
+            missing.append("--delta-budget")
+        if args.delta_per_query is None:
+            missing.append("--delta-per-query")
+        if missing:
+            raise ValueError(
+                f"--rule-type is 'differential_privacy' but missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+        if args.threshold is not None:
+            print(
+                "  NOTE: rule-type is 'differential_privacy' — ignoring "
+                "--threshold (that field only applies to 'aggregation')."
+            )
+
+
 def create_or_get_exchange(client, project_id, location, exchange_id, display_name):
     parent = f"projects/{project_id}/locations/{location}"
     name = f"{parent}/dataExchanges/{exchange_id}"
@@ -115,25 +183,62 @@ def create_or_get_exchange(client, project_id, location, exchange_id, display_na
         return result
 
 
-def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
-                            source_table, privacy_unit_col, threshold,
-                            columns=None):
-    """Creates (or replaces) the privacy-safe view.
+def build_privacy_policy_json(rule_type, privacy_unit_col, threshold,
+                               epsilon_budget, max_epsilon_per_query,
+                               delta_budget, delta_per_query,
+                               max_groups_contributed):
+    """Builds the OPTIONS(privacy_policy=...) JSON string for the chosen
+    rule type. The two policies have entirely different shapes — this is
+    NOT a variant of the same object, it's a different analysis rule."""
+    if rule_type == "aggregation":
+        return (
+            '{"aggregation_threshold_policy": '
+            f'{{"threshold": {threshold}, "privacy_unit_column": "{privacy_unit_col}"}}}}'
+        )
 
-    If `columns` is falsy/empty -> "Use all columns" (SELECT *).
+    # differential_privacy
+    dp_fields = {
+        "privacy_unit_column": privacy_unit_col,
+        "epsilon_budget": epsilon_budget,
+        "max_epsilon_per_query": max_epsilon_per_query,
+        "delta_budget": delta_budget,
+        "delta_per_query": delta_per_query,
+    }
+    if max_groups_contributed is not None:
+        dp_fields["max_groups_contributed"] = max_groups_contributed
+
+    parts = []
+    for key, val in dp_fields.items():
+        if key == "privacy_unit_column":
+            parts.append(f'"{key}": "{val}"')
+        else:
+            parts.append(f'"{key}": {val}')
+    inner = ", ".join(parts)
+    return f'{{"differential_privacy_policy": {{{inner}}}}}'
+
+
+def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
+                            source_table, privacy_unit_col, rule_type,
+                            threshold=None, epsilon_budget=None,
+                            max_epsilon_per_query=None, delta_budget=None,
+                            delta_per_query=None, max_groups_contributed=None,
+                            columns=None):
+    """Creates (or replaces) the privacy-safe view under either analysis
+    rule. If `columns` is falsy/empty -> "Use all columns" (SELECT *).
     If `columns` is a non-empty list -> "Custom select columns to publish".
     The privacy_unit_col is always force-included in the custom list since
-    the aggregation threshold policy needs it present in the view, even if
-    the caller forgot to list it explicitly.
+    both rule types need it present in the view, even if the caller forgot
+    to list it explicitly.
 
     Assumes columns/privacy_unit_col have already been validated against
     the real table schema via validate_columns().
     """
     view_ref = f"`{project_id}.{dataset_id}.{view_name}`"
     source_ref = f"`{project_id}.{dataset_id}.{source_table}`"
-    privacy_policy_json = (
-        '{"aggregation_threshold_policy": '
-        f'{{"threshold": {threshold}, "privacy_unit_column": "{privacy_unit_col}"}}}}'
+    privacy_policy_json = build_privacy_policy_json(
+        rule_type, privacy_unit_col, threshold, epsilon_budget,
+        max_epsilon_per_query, delta_budget, delta_per_query,
+        max_groups_contributed,
     )
 
     if columns:
@@ -155,7 +260,8 @@ def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
     """
     job = bq_client.query(query)
     job.result()  # wait for completion, raises on error
-    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name} [{mode_desc}]")
+    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name} "
+          f"[{rule_type}, {mode_desc}]")
 
 
 def create_or_update_listing(client, project_id, location, exchange_id,
@@ -240,7 +346,61 @@ def main():
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--source-table", required=True)
     p.add_argument("--privacy-unit-col", required=True)
-    p.add_argument("--threshold", type=int, required=True)
+
+    p.add_argument(
+        "--rule-type",
+        choices=["aggregation", "differential_privacy"],
+        default="aggregation",
+        help="Which analysis rule to apply to the shared view.",
+    )
+
+    # Aggregation threshold fields
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help="Required if --rule-type=aggregation. Minimum distinct entity "
+             "count required to release a result row.",
+    )
+
+    # Differential privacy fields
+    p.add_argument(
+        "--epsilon-budget",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Total epsilon "
+             "budget for all queries against the view.",
+    )
+    p.add_argument(
+        "--max-epsilon-per-query",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Caps how much "
+             "epsilon any single query can consume.",
+    )
+    p.add_argument(
+        "--delta-budget",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Total delta "
+             "budget for all queries against the view.",
+    )
+    p.add_argument(
+        "--delta-per-query",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Caps how much "
+             "delta any single query can consume.",
+    )
+    p.add_argument(
+        "--max-groups-contributed",
+        type=int,
+        default=None,
+        help="Optional, only used if --rule-type=differential_privacy. "
+             "Limits how many distinct groups one privacy unit can appear "
+             "across.",
+    )
+
     p.add_argument(
         "--columns",
         default="",
@@ -257,6 +417,11 @@ def main():
         help="If set, subscribers CAN save/export query results. Default: disabled (safer).",
     )
     args = p.parse_args()
+
+    # Fail fast if the fields required for the chosen rule type weren't
+    # actually filled in (GitHub Actions can't hide irrelevant form fields,
+    # so this is the real validation gate).
+    validate_rule_type_args(args)
 
     # Auto-prefix plain emails with "user:" — lets people type just their
     # email address instead of needing to remember the user:/group: syntax.
@@ -291,10 +456,16 @@ def main():
         f"/dataExchanges/{exchange_id}"
     )
 
-    print(f"[3/5] Privacy-safe view: {view_name}")
+    print(f"[3/5] Privacy-safe view ({args.rule_type}): {view_name}")
     create_or_replace_view(
         bq_client, args.project_id, args.dataset_id, view_name,
-        args.source_table, args.privacy_unit_col, args.threshold,
+        args.source_table, args.privacy_unit_col, args.rule_type,
+        threshold=args.threshold,
+        epsilon_budget=args.epsilon_budget,
+        max_epsilon_per_query=args.max_epsilon_per_query,
+        delta_budget=args.delta_budget,
+        delta_per_query=args.delta_per_query,
+        max_groups_contributed=args.max_groups_contributed,
         columns=columns,
     )
 
