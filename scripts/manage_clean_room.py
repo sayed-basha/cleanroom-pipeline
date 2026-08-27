@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Create or update a BigQuery Analytics Hub data clean room, add a
-privacy-safe (threshold-enforced) view, and grant publisher/subscriber
-access — all via the official Google Cloud SDK, no Terraform involved.
+privacy-safe view (aggregation threshold OR differential privacy), and
+grant publisher/subscriber access — all via the official Google Cloud SDK,
+no Terraform involved.
 
-Usage:
+Usage (aggregation threshold — the default):
   python manage_clean_room.py \
       --clean-room-name patient_data \
       --project-id project-123456789 \
@@ -12,7 +13,27 @@ Usage:
       --dataset-id my_patient_dataset \
       --source-table patien_table \
       --privacy-unit-col patient_id \
+      --rule-type aggregation \
       --threshold 50 \
+      --columns "age,zip_code,diagnosis" \
+      --publishers user:alice@gmail.com \
+      --subscribers user:bob@gmail.com
+
+Usage (differential privacy):
+  python manage_clean_room.py \
+      --clean-room-name patient_data \
+      --project-id project-123456789 \
+      --location asia-southeast1 \
+      --dataset-id my_patient_dataset \
+      --source-table patien_table \
+      --privacy-unit-col patient_id \
+      --rule-type differential_privacy \
+      --epsilon-budget 10 \
+      --max-epsilon-per-query 1 \
+      --delta-budget 1e-5 \
+      --delta-per-query 1e-7 \
+      --max-groups-contributed 1 \
+      --columns "age,zip_code,diagnosis" \
       --publishers user:alice@gmail.com \
       --subscribers user:bob@gmail.com
 """
@@ -38,6 +59,102 @@ def normalize_principal(value):
     if value.startswith(known_prefixes):
         return value
     return f"user:{value}"
+
+
+def get_table_schema(bq_client, project_id, dataset_id, source_table):
+    """Returns the set of top-level column names actually present on the
+    source table, straight from BigQuery's own metadata. Raises a clear
+    error immediately if the table doesn't exist, instead of letting that
+    surface later as a confusing failure from CREATE VIEW."""
+    table_ref = f"{project_id}.{dataset_id}.{source_table}"
+    try:
+        table = bq_client.get_table(table_ref)
+    except NotFound:
+        raise ValueError(
+            f"Source table not found: {table_ref}. "
+            f"Check --project-id, --dataset-id, and --source-table."
+        )
+    return {field.name for field in table.schema}
+
+
+def validate_columns(existing_columns, privacy_unit_col, requested_columns,
+                      source_table):
+    """Checks --privacy-unit-col and every entry in --columns against the
+    real schema. Fails fast with a specific list of what's wrong, rather
+    than letting an invalid CREATE VIEW statement hit the BigQuery API.
+
+    Note: this only validates top-level field names. Nested/repeated
+    (STRUCT/ARRAY) fields addressed with dotted paths, e.g. 'address.zip',
+    are not checked here and will pass through to BigQuery as-is.
+    """
+    missing = []
+
+    if privacy_unit_col not in existing_columns:
+        missing.append(privacy_unit_col)
+
+    for col in requested_columns:
+        # Skip dotted/nested paths — top-level schema listing can't validate
+        # these, so let BigQuery be the source of truth for those.
+        if "." in col:
+            continue
+        if col not in existing_columns:
+            missing.append(col)
+
+    if missing:
+        available = ", ".join(sorted(existing_columns))
+        bad = ", ".join(sorted(set(missing)))
+        raise ValueError(
+            f"Column(s) not found on table '{source_table}': {bad}.\n"
+            f"Available columns: {available}"
+        )
+
+
+def validate_rule_type_args(args):
+    """Cross-checks which fields were actually supplied against which rule
+    type was chosen. GitHub Actions can't hide irrelevant form fields, so
+    this is the real gate: it errors out clearly if the required fields for
+    the chosen rule type are missing, and warns (without failing) if fields
+    belonging to the *other* rule type were filled in by mistake."""
+    if args.rule_type == "aggregation":
+        if args.threshold is None:
+            raise ValueError(
+                "--threshold is required when --rule-type is 'aggregation'."
+            )
+        supplied_dp_fields = [
+            name for name, val in [
+                ("--epsilon-budget", args.epsilon_budget),
+                ("--max-epsilon-per-query", args.max_epsilon_per_query),
+                ("--delta-budget", args.delta_budget),
+                ("--delta-per-query", args.delta_per_query),
+                ("--max-groups-contributed", args.max_groups_contributed),
+            ] if val is not None
+        ]
+        if supplied_dp_fields:
+            print(
+                f"  NOTE: rule-type is 'aggregation' — ignoring differential "
+                f"privacy field(s) that were filled in: {', '.join(supplied_dp_fields)}"
+            )
+
+    elif args.rule_type == "differential_privacy":
+        missing = []
+        if args.epsilon_budget is None:
+            missing.append("--epsilon-budget")
+        if args.max_epsilon_per_query is None:
+            missing.append("--max-epsilon-per-query")
+        if args.delta_budget is None:
+            missing.append("--delta-budget")
+        if args.delta_per_query is None:
+            missing.append("--delta-per-query")
+        if missing:
+            raise ValueError(
+                f"--rule-type is 'differential_privacy' but missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+        if args.threshold is not None:
+            print(
+                "  NOTE: rule-type is 'differential_privacy' — ignoring "
+                "--threshold (that field only applies to 'aggregation')."
+            )
 
 
 def create_or_get_exchange(client, project_id, location, exchange_id, display_name):
@@ -66,22 +183,85 @@ def create_or_get_exchange(client, project_id, location, exchange_id, display_na
         return result
 
 
+def build_privacy_policy_json(rule_type, privacy_unit_col, threshold,
+                               epsilon_budget, max_epsilon_per_query,
+                               delta_budget, delta_per_query,
+                               max_groups_contributed):
+    """Builds the OPTIONS(privacy_policy=...) JSON string for the chosen
+    rule type. The two policies have entirely different shapes — this is
+    NOT a variant of the same object, it's a different analysis rule."""
+    if rule_type == "aggregation":
+        return (
+            '{"aggregation_threshold_policy": '
+            f'{{"threshold": {threshold}, "privacy_unit_column": "{privacy_unit_col}"}}}}'
+        )
+
+    # differential_privacy
+    dp_fields = {
+        "privacy_unit_column": privacy_unit_col,
+        "epsilon_budget": epsilon_budget,
+        "max_epsilon_per_query": max_epsilon_per_query,
+        "delta_budget": delta_budget,
+        "delta_per_query": delta_per_query,
+    }
+    if max_groups_contributed is not None:
+        dp_fields["max_groups_contributed"] = max_groups_contributed
+
+    parts = []
+    for key, val in dp_fields.items():
+        if key == "privacy_unit_column":
+            parts.append(f'"{key}": "{val}"')
+        else:
+            parts.append(f'"{key}": {val}')
+    inner = ", ".join(parts)
+    return f'{{"differential_privacy_policy": {{{inner}}}}}'
+
+
 def create_or_replace_view(bq_client, project_id, dataset_id, view_name,
-                            source_table, privacy_unit_col, threshold):
+                            source_table, privacy_unit_col, rule_type,
+                            threshold=None, epsilon_budget=None,
+                            max_epsilon_per_query=None, delta_budget=None,
+                            delta_per_query=None, max_groups_contributed=None,
+                            columns=None):
+    """Creates (or replaces) the privacy-safe view under either analysis
+    rule. If `columns` is falsy/empty -> "Use all columns" (SELECT *).
+    If `columns` is a non-empty list -> "Custom select columns to publish".
+    The privacy_unit_col is always force-included in the custom list since
+    both rule types need it present in the view, even if the caller forgot
+    to list it explicitly.
+
+    Assumes columns/privacy_unit_col have already been validated against
+    the real table schema via validate_columns().
+    """
     view_ref = f"`{project_id}.{dataset_id}.{view_name}`"
     source_ref = f"`{project_id}.{dataset_id}.{source_table}`"
-    privacy_policy_json = (
-        '{"aggregation_threshold_policy": '
-        f'{{"threshold": {threshold}, "privacy_unit_column": "{privacy_unit_col}"}}}}'
+    privacy_policy_json = build_privacy_policy_json(
+        rule_type, privacy_unit_col, threshold, epsilon_budget,
+        max_epsilon_per_query, delta_budget, delta_per_query,
+        max_groups_contributed,
     )
+
+    if columns:
+        # Custom select columns to publish.
+        select_cols = list(dict.fromkeys(columns))  # de-dupe, keep order
+        if privacy_unit_col not in select_cols:
+            select_cols.append(privacy_unit_col)
+        select_clause = ", ".join(f"`{c}`" for c in select_cols)
+        mode_desc = f"custom columns ({select_clause})"
+    else:
+        # Use all columns.
+        select_clause = "*"
+        mode_desc = "all columns"
+
     query = f"""
         CREATE OR REPLACE VIEW {view_ref}
         OPTIONS (privacy_policy = '''{privacy_policy_json}''')
-        AS SELECT * FROM {source_ref}
+        AS SELECT {select_clause} FROM {source_ref}
     """
     job = bq_client.query(query)
     job.result()  # wait for completion, raises on error
-    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name}")
+    print(f"  Created/updated view: {project_id}.{dataset_id}.{view_name} "
+          f"[{rule_type}, {mode_desc}]")
 
 
 def create_or_update_listing(client, project_id, location, exchange_id,
@@ -166,7 +346,69 @@ def main():
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--source-table", required=True)
     p.add_argument("--privacy-unit-col", required=True)
-    p.add_argument("--threshold", type=int, required=True)
+
+    p.add_argument(
+        "--rule-type",
+        choices=["aggregation", "differential_privacy"],
+        default="aggregation",
+        help="Which analysis rule to apply to the shared view.",
+    )
+
+    # Aggregation threshold fields
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help="Required if --rule-type=aggregation. Minimum distinct entity "
+             "count required to release a result row.",
+    )
+
+    # Differential privacy fields
+    p.add_argument(
+        "--epsilon-budget",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Total epsilon "
+             "budget for all queries against the view.",
+    )
+    p.add_argument(
+        "--max-epsilon-per-query",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Caps how much "
+             "epsilon any single query can consume.",
+    )
+    p.add_argument(
+        "--delta-budget",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Total delta "
+             "budget for all queries against the view.",
+    )
+    p.add_argument(
+        "--delta-per-query",
+        type=float,
+        default=None,
+        help="Required if --rule-type=differential_privacy. Caps how much "
+             "delta any single query can consume.",
+    )
+    p.add_argument(
+        "--max-groups-contributed",
+        type=int,
+        default=None,
+        help="Optional, only used if --rule-type=differential_privacy. "
+             "Limits how many distinct groups one privacy unit can appear "
+             "across.",
+    )
+
+    p.add_argument(
+        "--columns",
+        default="",
+        help=(
+            "Comma or space separated list of columns to publish "
+            "(e.g. 'age,zip_code,diagnosis'). Leave blank to use all columns."
+        ),
+    )
     p.add_argument("--publishers", nargs="*", default=[])
     p.add_argument("--subscribers", nargs="*", default=[])
     p.add_argument(
@@ -176,11 +418,19 @@ def main():
     )
     args = p.parse_args()
 
+    # Fail fast if the fields required for the chosen rule type weren't
+    # actually filled in (GitHub Actions can't hide irrelevant form fields,
+    # so this is the real validation gate).
+    validate_rule_type_args(args)
+
     # Auto-prefix plain emails with "user:" — lets people type just their
     # email address instead of needing to remember the user:/group: syntax.
     # Also drops any blank entries (e.g. when the field was left empty).
     args.publishers = [normalize_principal(m) for m in args.publishers if m]
     args.subscribers = [normalize_principal(m) for m in args.subscribers if m]
+
+    # Accept comma-separated or space-separated column lists.
+    columns = [c.strip() for c in args.columns.replace(",", " ").split() if c.strip()]
 
     exchange_id = f"cleanroom_{args.clean_room_name}"
     listing_id = f"listing_{args.clean_room_name}"
@@ -189,7 +439,14 @@ def main():
     ah_client = analyticshub.AnalyticsHubServiceClient()
     bq_client = bigquery.Client(project=args.project_id)
 
-    print(f"[1/4] Clean room exchange: {exchange_id}")
+    print(f"[1/5] Validating schema against source table: {args.source_table}")
+    existing_columns = get_table_schema(
+        bq_client, args.project_id, args.dataset_id, args.source_table
+    )
+    validate_columns(existing_columns, args.privacy_unit_col, columns, args.source_table)
+    print(f"  OK — {len(existing_columns)} column(s) found, all requested columns exist")
+
+    print(f"[2/5] Clean room exchange: {exchange_id}")
     create_or_get_exchange(
         ah_client, args.project_id, args.location, exchange_id,
         f"Clean Room - {args.clean_room_name}",
@@ -199,13 +456,20 @@ def main():
         f"/dataExchanges/{exchange_id}"
     )
 
-    print(f"[2/4] Privacy-safe view: {view_name}")
+    print(f"[3/5] Privacy-safe view ({args.rule_type}): {view_name}")
     create_or_replace_view(
         bq_client, args.project_id, args.dataset_id, view_name,
-        args.source_table, args.privacy_unit_col, args.threshold,
+        args.source_table, args.privacy_unit_col, args.rule_type,
+        threshold=args.threshold,
+        epsilon_budget=args.epsilon_budget,
+        max_epsilon_per_query=args.max_epsilon_per_query,
+        delta_budget=args.delta_budget,
+        delta_per_query=args.delta_per_query,
+        max_groups_contributed=args.max_groups_contributed,
+        columns=columns,
     )
 
-    print(f"[3/4] Listing: {listing_id}")
+    print(f"[4/5] Listing: {listing_id}")
     create_or_update_listing(
         ah_client, args.project_id, args.location, exchange_id, listing_id,
         args.dataset_id, view_name, f"Shared Data - {args.clean_room_name}",
@@ -213,7 +477,7 @@ def main():
     )
     listing_name = f"{exchange_name}/listings/{listing_id}"
 
-    print("[4/4] IAM grants")
+    print("[5/5] IAM grants")
     if args.publishers:
         grant_iam(
             ah_client, exchange_name, "roles/analyticshub.publisher",
